@@ -148,7 +148,10 @@ def prepare_args(command, args):
         return {
             'to_recipients': argToList(args.get('to')),
             'message_id': args.get('message_id', ''),
-            'comment': args.get('comment')
+            'comment': args.get('comment'),
+            'attach_ids': argToList(args.get('attach_ids')),
+            'attach_names': argToList(args.get('attach_names')),
+            'attach_cids': argToList((args.get('attach_cids')))
         }
 
     return args
@@ -608,7 +611,7 @@ class MsGraphClient:
         return message
 
     @staticmethod
-    def _build_reply(to_recipients, comment):
+    def _build_reply(to_recipients, comment, attach_ids, attach_names, attach_cids):
         """
         Builds the reply message that includes recipients to reply and reply message.
 
@@ -618,12 +621,22 @@ class MsGraphClient:
         :type comment: ``str``
         :param comment: The message to reply.
 
+        :type attach_ids: ``list``
+        :param attach_ids: List of uploaded to War Room regular attachments to send
+
+        :type attach_names: ``list``
+        :param attach_names: List of regular attachments names to send
+
+        :type attach_cids: ``list``
+        :param attach_cids: List of uploaded to War Room inline attachments to send
+
         :return: Returns legal reply message.
         :rtype: ``dict``
         """
         return {
             'message': {
-                'toRecipients': MsGraphClient._build_recipient_input(to_recipients)
+                'toRecipients': MsGraphClient._build_recipient_input(to_recipients),
+                'attachments': MsGraphClient._build_file_attachments_input(attach_ids, attach_names, attach_cids, [])
             },
             'comment': comment
         }
@@ -671,6 +684,9 @@ class MsGraphClient:
                 attachment_id = attachment.get('id', '')
                 attachment_content = self._get_attachment_mime(message_id, attachment_id)
                 attachment_name = f'{attachment_name}.eml'
+            else:
+                # skip attachments that are not of the previous types (type referenceAttachment)
+                continue
             # upload the item/file attachment to War Room
             upload_file(attachment_name, attachment_content, attachment_results)
 
@@ -688,8 +704,12 @@ class MsGraphClient:
         """
         parsed_email = MsGraphClient._parse_item_as_dict(email)
 
-        if email.get('hasAttachments', False):  # handling attachments of fetched email
-            parsed_email['Attachments'] = self._get_email_attachments(message_id=email.get('id', ''))
+        # handling attachments of fetched email
+        attachments = self._get_email_attachments(message_id=email.get('id', ''))
+        if attachments:
+            parsed_email['Attachments'] = attachments
+
+        parsed_email['Mailbox'] = self._mailbox_to_fetch
 
         incident = {
             'name': parsed_email['Subject'],
@@ -764,7 +784,8 @@ class MsGraphClient:
         """
         Sends email from user's mailbox, the sent message will appear in Sent Items folder
         """
-        suffix_endpoint = f'/users/{self._mailbox_to_fetch}/sendMail'
+        from_address = kwargs.get('from', self._mailbox_to_fetch)
+        suffix_endpoint = f'/users/{from_address}/sendMail'
         message_content = MsGraphClient._build_message(**kwargs)
         self.ms_client.http_request('POST', suffix_endpoint, json_data={'message': message_content},
                                     resp_type="text")
@@ -776,7 +797,7 @@ class MsGraphClient:
 
         return human_readable, ec
 
-    def reply_to(self, to_recipients, comment, message_id):
+    def reply_to(self, to_recipients, comment, message_id, attach_ids, attach_names, attach_cids):
         """
         Sends reply message to recipients.
 
@@ -789,11 +810,20 @@ class MsGraphClient:
         :type message_id: ``str``
         :param message_id: The message id to reply.
 
+        :type attach_ids: ``list``
+        :param attach_ids: List of uploaded to War Room regular attachments to send
+
+        :type attach_names: ``list``
+        :param attach_names: List of regular attachments names to send
+
+        :type attach_cids: ``list``
+        :param attach_cids: List of uploaded to War Room inline attachments to send
+
         :return: String representation of markdown message regarding successful message submission.
         rtype: ``str``
         """
         suffix_endpoint = f'/users/{self._mailbox_to_fetch}/messages/{message_id}/reply'
-        reply = MsGraphClient._build_reply(to_recipients, comment)
+        reply = MsGraphClient._build_reply(to_recipients, comment, attach_ids, attach_names, attach_cids)
         self.ms_client.http_request('POST', suffix_endpoint, json_data=reply, resp_type="text")
 
         return f'### Replied to: {", ".join(to_recipients)} with comment: {comment}'

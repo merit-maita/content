@@ -2,7 +2,6 @@ import base64
 import fnmatch
 import glob
 import json
-import logging
 import os
 import re
 import shutil
@@ -26,6 +25,7 @@ import Tests.Marketplace.marketplace_statistics as mp_statistics
 from Tests.Marketplace.marketplace_constants import PackFolders, Metadata, GCPConfig, BucketUploadFlow, PACKS_FOLDER, \
     PackTags, PackIgnored, Changelog
 from Utils.release_notes_generator import aggregate_release_notes_for_marketplace
+from Tests.scripts.utils import logging_wrapper as logging
 
 
 class Pack(object):
@@ -55,9 +55,11 @@ class Pack(object):
     EXCLUDE_DIRECTORIES = [PackFolders.TEST_PLAYBOOKS.value]
     RELEASE_NOTES = "ReleaseNotes"
 
-    def __init__(self, pack_name, pack_path):
+    def __init__(self, pack_name, pack_path, marketplace):
         self._pack_name = pack_name
         self._pack_path = pack_path
+        self._zip_path = None  # zip_path will be updated as part of zip_pack
+        self._marketplace = marketplace
         self._status = None
         self._public_storage_path = ""
         self._remove_files_list = []  # tracking temporary files, in order to delete in later step
@@ -105,6 +107,7 @@ class Pack(object):
         self._contains_transformer = False  # initialized in collect_content_items function
         self._contains_filter = False  # initialized in collect_content_items function
         self._is_missing_dependencies = False  # a flag that specifies if pack is missing dependencies
+        self.should_upload_to_marketplace = True  # initialized in load_user_metadata function
 
     @property
     def name(self):
@@ -151,7 +154,7 @@ class Pack(object):
         """
         self._is_feed = is_feed
 
-    @status.setter
+    @status.setter  # type: ignore[attr-defined,no-redef]
     def status(self, status_value):
         """ setter of pack current status.
         """
@@ -229,7 +232,7 @@ class Pack(object):
         """
         return self._user_metadata
 
-    @display_name.setter
+    @display_name.setter  # type: ignore[attr-defined,no-redef]
     def display_name(self, display_name_value):
         """ setter of display name property of the pack.
         """
@@ -322,6 +325,10 @@ class Pack(object):
     def is_missing_dependencies(self):
         return self._is_missing_dependencies
 
+    @property
+    def zip_path(self):
+        return self._zip_path
+
     def _get_latest_version(self):
         """ Return latest semantic version of the pack.
 
@@ -398,7 +405,7 @@ class Pack(object):
             list: collection of integration display name and it's path in gcs.
 
         """
-        dependencies_integration_images_dict = {}
+        dependencies_integration_images_dict: dict = {}
         additional_dependencies_data = {k: v for k, v in dependencies_data.items() if k in display_dependencies_images}
 
         for dependency_data in additional_dependencies_data.values():
@@ -587,7 +594,7 @@ class Pack(object):
             Metadata.VERSION_INFO: build_number,
             Metadata.COMMIT: commit_hash,
             Metadata.DOWNLOADS: self._downloads_count,
-            Metadata.TAGS: list(self._tags),
+            Metadata.TAGS: list(self._tags or []),
             Metadata.CATEGORIES: self._categories,
             Metadata.CONTENT_ITEMS: self._content_items,
             Metadata.SEARCH_RANK: self._search_rank,
@@ -779,6 +786,31 @@ class Pack(object):
             return task_status
 
     @staticmethod
+    def zip_folder_items(source_path, source_name, zip_pack_path):
+        """
+        Zips the source_path
+        Args:
+            source_path (str): The source path of the folder the items are in.
+            zip_pack_path (str): The path to the zip folder.
+            source_name (str): The name of the source that should be zipped.
+        """
+        task_status = False
+        try:
+            with ZipFile(zip_pack_path, 'w', ZIP_DEFLATED) as pack_zip:
+                for root, dirs, files in os.walk(source_path, topdown=True):
+                    for f in files:
+                        full_file_path = os.path.join(root, f)
+                        relative_file_path = os.path.relpath(full_file_path, source_path)
+                        pack_zip.write(filename=full_file_path, arcname=relative_file_path)
+
+            task_status = True
+            logging.success(f"Finished zipping {source_name} folder.")
+        except Exception:
+            logging.exception(f"Failed in zipping {source_name} folder")
+        finally:
+            return task_status
+
+    @staticmethod
     def encrypt_pack(zip_pack_path, pack_name, encryption_key, extract_destination_path,
                      private_artifacts_dir, secondary_encryption_key):
         """ decrypt the pack in order to see that the pack was encrypted in the first place.
@@ -871,7 +903,7 @@ class Pack(object):
         """
         return self.decrypt_pack(encrypted_zip_pack_path, decryption_key)
 
-    def zip_pack(self, extract_destination_path="", pack_name="", encryption_key="",
+    def zip_pack(self, extract_destination_path="", encryption_key="",
                  private_artifacts_dir='private_artifacts', secondary_encryption_key=""):
         """ Zips pack folder.
 
@@ -879,28 +911,21 @@ class Pack(object):
             bool: whether the operation succeeded.
             str: full path to created pack zip.
         """
-        zip_pack_path = f"{self._pack_path}.zip" if not encryption_key else f"{self._pack_path}_not_encrypted.zip"
-        task_status = False
-
-        try:
-            with ZipFile(zip_pack_path, 'w', ZIP_DEFLATED) as pack_zip:
-                for root, dirs, files in os.walk(self._pack_path, topdown=True):
-                    for f in files:
-                        full_file_path = os.path.join(root, f)
-                        relative_file_path = os.path.relpath(full_file_path, self._pack_path)
-                        pack_zip.write(filename=full_file_path, arcname=relative_file_path)
-
-            if encryption_key:
-                self.encrypt_pack(zip_pack_path, pack_name, encryption_key, extract_destination_path,
+        self._zip_path = f"{self._pack_path}.zip" if not encryption_key else f"{self._pack_path}_not_encrypted.zip"
+        source_path = self._pack_path
+        source_name = self._pack_name
+        task_status = self.zip_folder_items(source_path, source_name, self._zip_path)
+        # if failed to zip, skip encryption
+        if task_status and encryption_key:
+            try:
+                Pack.encrypt_pack(self._zip_path, source_name, encryption_key, extract_destination_path,
                                   private_artifacts_dir, secondary_encryption_key)
-            task_status = True
-            logging.success(f"Finished zipping {self._pack_name} pack.")
-        except Exception:
-            logging.exception(f"Failed in zipping {self._pack_name} folder")
-        finally:
-            # If the pack needs to be encrypted, it is initially at a different location than this final path
-            final_path_to_zipped_pack = f"{self._pack_path}.zip"
-            return task_status, final_path_to_zipped_pack
+                # If the pack needs to be encrypted, it is initially at a different location than this final path
+            except Exception:
+                task_status = False
+                logging.exception(f"Failed in encrypting {source_name} folder")
+        final_path_to_zipped_pack = f"{source_path}.zip"
+        return task_status, final_path_to_zipped_pack
 
     def detect_modified(self, content_repo, index_folder_path, current_commit_hash, previous_commit_hash):
         """ Detects pack modified files.
@@ -964,11 +989,12 @@ class Pack(object):
             return task_status, modified_rn_files_paths, pack_was_modified
 
     def upload_to_storage(self, zip_pack_path, latest_version, storage_bucket, override_pack, storage_base_path,
-                          private_content=False, pack_artifacts_path=None):
+                          private_content=False, pack_artifacts_path=None, overridden_upload_path=None):
         """ Manages the upload of pack zip artifact to correct path in cloud storage.
-        The zip pack will be uploaded to following path: /content/packs/pack_name/pack_latest_version.
+        The zip pack will be uploaded by defaualt to following path: /content/packs/pack_name/pack_latest_version.
         In case that zip pack artifact already exist at constructed path, the upload will be skipped.
         If flag override_pack is set to True, pack will forced for upload.
+        If item_upload_path is provided it will override said path, and will save the item to that destination.
 
         Args:
             zip_pack_path (str): full path to pack zip artifact.
@@ -976,7 +1002,11 @@ class Pack(object):
             storage_bucket (google.cloud.storage.bucket.Bucket): google cloud storage bucket.
             override_pack (bool): whether to override existing pack.
             private_content (bool): Is being used in a private content build.
+            storage_base_path (str): The upload destination in the target bucket for all packs (in the format of
+                                     <some_path_in_the_target_bucket>/content/Packs).
+
             pack_artifacts_path (str): Path to where we are saving pack artifacts.
+            overridden_upload_path (str): If provided, will override version_pack_path calculation and will use this path instead
 
         Returns:
             bool: whether the operation succeeded.
@@ -986,16 +1016,26 @@ class Pack(object):
         task_status = True
 
         try:
-            version_pack_path = os.path.join(storage_base_path, self._pack_name, latest_version)
-            existing_files = [f.name for f in storage_bucket.list_blobs(prefix=version_pack_path)]
+            if overridden_upload_path:
+                if private_content:
+                    logging.warning("Private content does not support overridden argument")
+                    return task_status, True, None
+                zip_to_upload_full_path = overridden_upload_path
+            else:
+                version_pack_path = os.path.join(storage_base_path, self._pack_name, latest_version)
+                existing_files = [f.name for f in storage_bucket.list_blobs(prefix=version_pack_path)]
 
-            if existing_files and not override_pack:
-                logging.warning(f"The following packs already exist at storage: {', '.join(existing_files)}")
-                logging.warning(f"Skipping step of uploading {self._pack_name}.zip to storage.")
-                return task_status, True, None
+                if override_pack:
+                    logging.warning(f"Uploading {self._pack_name} pack to storage and overriding the existing pack "
+                                    f"files already in storage.")
 
-            pack_full_path = os.path.join(version_pack_path, f"{self._pack_name}.zip")
-            blob = storage_bucket.blob(pack_full_path)
+                elif existing_files:
+                    logging.warning(f"The following packs already exist at storage: {', '.join(existing_files)}")
+                    logging.warning(f"Skipping step of uploading {self._pack_name}.zip to storage.")
+                    return task_status, True, None
+
+                zip_to_upload_full_path = os.path.join(version_pack_path, f"{self._pack_name}.zip")
+            blob = storage_bucket.blob(zip_to_upload_full_path)
             blob.cache_control = "no-cache,max-age=0"  # disabling caching for pack blob
 
             with open(zip_pack_path, "rb") as pack_zip:
@@ -1006,7 +1046,7 @@ class Pack(object):
                                                                     secondary_encryption_key_pack_name)
 
                 #  In some cases the path given is actually a zip.
-                if pack_artifacts_path.endswith('content_packs.zip'):
+                if isinstance(pack_artifacts_path, str) and pack_artifacts_path.endswith('content_packs.zip'):
                     _pack_artifacts_path = pack_artifacts_path.replace('/content_packs.zip', '')
                 else:
                     _pack_artifacts_path = pack_artifacts_path
@@ -1026,9 +1066,9 @@ class Pack(object):
                             f'{_pack_artifacts_path}/packs/{self._pack_name}.zip')
 
             self.public_storage_path = blob.public_url
-            logging.success(f"Uploaded {self._pack_name} pack to {pack_full_path} path.")
+            logging.success(f"Uploaded {self._pack_name} pack to {zip_to_upload_full_path} path.")
 
-            return task_status, False, pack_full_path
+            return task_status, False, zip_to_upload_full_path
         except Exception:
             task_status = False
             logging.exception(f"Failed in uploading {self._pack_name} pack to gcs.")
@@ -1195,7 +1235,8 @@ class Pack(object):
 
         """
         lowest_version = [LooseVersion(Pack.PACK_INITIAL_VERSION)]
-        lower_versions, higher_versions = [], []
+        lower_versions: list = []
+        higher_versions: list = []
         same_block_versions_dict: dict = dict()
         for item in changelog.keys():  # divide the versions into lists of lower and higher than given version
             (lower_versions if LooseVersion(item) < version else higher_versions).append(LooseVersion(item))
@@ -1275,7 +1316,7 @@ class Pack(object):
             changelog: The changelog from the production bucket.
             latest_release_notes: The latest release notes version string in the current branch
         """
-        changelog_latest_release_notes = max(changelog, key=lambda k: LooseVersion(k))
+        changelog_latest_release_notes = max(changelog, key=lambda k: LooseVersion(k))  # pylint: disable=W0108
         assert LooseVersion(latest_release_notes) >= LooseVersion(changelog_latest_release_notes), \
             f'{self._pack_name}: Version mismatch detected between upload bucket and current branch\n' \
             f'Upload bucket version: {changelog_latest_release_notes}\n' \
@@ -1465,7 +1506,7 @@ class Pack(object):
             .
         """
         task_status = False
-        content_items_result = {}
+        content_items_result: dict = {}
 
         try:
             # the format is defined in issue #19786, may change in the future
@@ -1488,6 +1529,7 @@ class Pack(object):
                 PackFolders.GENERIC_TYPES.value: "generictype",
                 PackFolders.LISTS.value: "list",
                 PackFolders.PREPROCESS_RULES.value: "preprocessrule",
+                PackFolders.JOBS.value: "job",
             }
 
             for root, pack_dirs, pack_files_names in os.walk(self._pack_path, topdown=False):
@@ -1544,9 +1586,10 @@ class Pack(object):
 
                     if current_directory == PackFolders.SCRIPTS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'description': content_item.get('comment', ""),
-                            'tags': content_item_tags
+                            'id': content_item.get('commonfields', {}).get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'description': content_item.get('comment', ''),
+                            'tags': content_item_tags,
                         })
 
                         if not self._contains_transformer and 'transformer' in content_item_tags:
@@ -1558,103 +1601,145 @@ class Pack(object):
                     elif current_directory == PackFolders.PLAYBOOKS.value:
                         self.is_feed_pack(content_item, 'Playbook')
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'description': content_item.get('description', "")
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'description': content_item.get('description', ''),
                         })
+
                     elif current_directory == PackFolders.INTEGRATIONS.value:
                         integration_commands = content_item.get('script', {}).get('commands', [])
                         self.is_feed_pack(content_item, 'Integration')
                         folder_collected_items.append({
-                            'name': content_item.get('display', ""),
-                            'description': content_item.get('description', ""),
-                            'category': content_item.get('category', ""),
+                            'id': content_item.get('commonfields', {}).get('id', ''),
+                            'name': content_item.get('display', ''),
+                            'description': content_item.get('description', ''),
+                            'category': content_item.get('category', ''),
                             'commands': [
-                                {'name': c.get('name', ""), 'description': c.get('description', "")}
-                                for c in integration_commands]
+                                {'name': c.get('name', ''), 'description': c.get('description', '')}
+                                for c in integration_commands],
                         })
+
                     elif current_directory == PackFolders.INCIDENT_FIELDS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'type': content_item.get('type', ""),
-                            'description': content_item.get('description', "")
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'type': content_item.get('type', ''),
+                            'description': content_item.get('description', ''),
                         })
+
                     elif current_directory == PackFolders.INCIDENT_TYPES.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'playbook': content_item.get('playbookId', ""),
-                            'closureScript': content_item.get('closureScript', ""),
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'playbook': content_item.get('playbookId', ''),
+                            'closureScript': content_item.get('closureScript', ''),
                             'hours': int(content_item.get('hours', 0)),
                             'days': int(content_item.get('days', 0)),
-                            'weeks': int(content_item.get('weeks', 0))
+                            'weeks': int(content_item.get('weeks', 0)),
                         })
+
                     elif current_directory == PackFolders.DASHBOARDS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', "")
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
                         })
+
                     elif current_directory == PackFolders.INDICATOR_FIELDS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'type': content_item.get('type', ""),
-                            'description': content_item.get('description', "")
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'type': content_item.get('type', ''),
+                            'description': content_item.get('description', ''),
                         })
+
                     elif current_directory == PackFolders.REPORTS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'description': content_item.get('description', "")
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'description': content_item.get('description', ''),
                         })
+
                     elif current_directory == PackFolders.INDICATOR_TYPES.value:
                         folder_collected_items.append({
-                            'details': content_item.get('details', ""),
-                            'reputationScriptName': content_item.get('reputationScriptName', ""),
-                            'enhancementScriptNames': content_item.get('enhancementScriptNames', [])
+                            'id': content_item.get('id', ''),
+                            'details': content_item.get('details', ''),
+                            'reputationScriptName': content_item.get('reputationScriptName', ''),
+                            'enhancementScriptNames': content_item.get('enhancementScriptNames', []),
                         })
+
                     elif current_directory == PackFolders.LAYOUTS.value:
                         layout_metadata = {
-                            'name': content_item.get('name', '')
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
                         }
                         layout_description = content_item.get('description')
                         if layout_description is not None:
                             layout_metadata['description'] = layout_description
                         folder_collected_items.append(layout_metadata)
+
                     elif current_directory == PackFolders.CLASSIFIERS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name') or content_item.get('id', ""),
-                            'description': content_item.get('description', '')
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name') or content_item.get('id', ''),
+                            'description': content_item.get('description', ''),
                         })
+
                     elif current_directory == PackFolders.WIDGETS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'dataType': content_item.get('dataType', ""),
-                            'widgetType': content_item.get('widgetType', "")
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'dataType': content_item.get('dataType', ''),
+                            'widgetType': content_item.get('widgetType', ''),
                         })
+
                     elif current_directory == PackFolders.LISTS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', "")
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', '')
                         })
+
                     elif current_directory == PackFolders.GENERIC_DEFINITIONS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'description': content_item.get('description', ""),
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'description': content_item.get('description', ''),
                         })
+
                     elif parent_directory == PackFolders.GENERIC_FIELDS.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'description': content_item.get('description', ""),
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'description': content_item.get('description', ''),
+                            'type': content_item.get('type', ''),
                         })
+
                     elif current_directory == PackFolders.GENERIC_MODULES.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'description': content_item.get('description', ""),
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'description': content_item.get('description', ''),
                         })
+
                     elif parent_directory == PackFolders.GENERIC_TYPES.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'description': content_item.get('description', ""),
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'description': content_item.get('description', ''),
                         })
+
                     elif current_directory == PackFolders.PREPROCESS_RULES.value:
                         folder_collected_items.append({
-                            'name': content_item.get('name', ""),
-                            'description': content_item.get('description', ""),
+                            'id': content_item.get('id', ''),
+                            'name': content_item.get('name', ''),
+                            'description': content_item.get('description', ''),
+                        })
+
+                    elif current_directory == PackFolders.JOBS.value:
+                        folder_collected_items.append({
+                            'id': content_item.get('id', ''),
+                            # note that `name` may technically be blank, but shouldn't pass validations
+                            'name': content_item.get('name', ''),
+                            'details': content_item.get('details', ''),
                         })
 
                 if current_directory in PackFolders.pack_displayed_items():
@@ -1670,7 +1755,7 @@ class Pack(object):
             self._content_items = content_items_result
             return task_status
 
-    def load_user_metadata(self):
+    def load_user_metadata(self, marketplace='xsoar'):
         """ Loads user defined metadata and stores part of it's data in defined properties fields.
 
         Returns:
@@ -1695,9 +1780,10 @@ class Pack(object):
             self.current_version = user_metadata.get(Metadata.CURRENT_VERSION, '')
             self.hidden = user_metadata.get(Metadata.HIDDEN, False)
             self.description = user_metadata.get(Metadata.DESCRIPTION, False)
-            self.display_name = user_metadata.get(Metadata.NAME, '')
+            self.display_name = user_metadata.get(Metadata.NAME, '')  # type: ignore[misc]
             self._user_metadata = user_metadata
             self.eula_link = user_metadata.get(Metadata.EULA_LINK, Metadata.EULA_URL)
+            self.should_upload_to_marketplace = marketplace in user_metadata.get('marketplaces', ['xsoar'])
 
             logging.info(f"Finished loading {self._pack_name} pack user metadata")
             task_status = True
@@ -1822,10 +1908,11 @@ class Pack(object):
         """
         task_status = False
         pack_names = pack_names if pack_names else []
+        is_missing_dependencies = False
 
         try:
             self.set_pack_dependencies(packs_dependencies_mapping)
-            if Metadata.DISPLAYED_IMAGES not in self.user_metadata:
+            if Metadata.DISPLAYED_IMAGES not in self.user_metadata and self._user_metadata:
                 self._user_metadata[Metadata.DISPLAYED_IMAGES] = packs_dependencies_mapping.get(
                     self._pack_name, {}).get(Metadata.DISPLAYED_IMAGES, [])
                 logging.info(f"Adding auto generated display images for {self._pack_name} pack")
@@ -1881,7 +1968,7 @@ class Pack(object):
 
         if metadata:
             if metadata.get(Metadata.CREATED):
-                created_time = metadata.get(Metadata.CREATED)
+                created_time = metadata.get(Metadata.CREATED, '')
             else:
                 raise Exception(f'The metadata file of the {pack_name} pack does not contain "{Metadata.CREATED}" time')
 
@@ -1907,22 +1994,25 @@ class Pack(object):
 
     def set_pack_dependencies(self, packs_dependencies_mapping):
         pack_dependencies = packs_dependencies_mapping.get(self._pack_name, {}).get(Metadata.DEPENDENCIES, {})
-        if Metadata.DEPENDENCIES not in self.user_metadata:
+        if Metadata.DEPENDENCIES not in self.user_metadata and self._user_metadata:
             self._user_metadata[Metadata.DEPENDENCIES] = {}
+
+        core_packs = GCPConfig.get_core_packs(self._marketplace)
 
         # If it is a core pack, check that no new mandatory packs (that are not core packs) were added
         # They can be overridden in the user metadata to be not mandatory so we need to check there as well
-        if self._pack_name in GCPConfig.CORE_PACKS_LIST:
+        if self._pack_name in core_packs:
             mandatory_dependencies = [k for k, v in pack_dependencies.items()
                                       if v.get(Metadata.MANDATORY, False) is True
-                                      and k not in GCPConfig.CORE_PACKS_LIST
+                                      and k not in core_packs
                                       and k not in self.user_metadata[Metadata.DEPENDENCIES].keys()]
             if mandatory_dependencies:
                 raise Exception(f'New mandatory dependencies {mandatory_dependencies} were '
                                 f'found in the core pack {self._pack_name}')
 
         pack_dependencies.update(self.user_metadata[Metadata.DEPENDENCIES])
-        self._user_metadata[Metadata.DEPENDENCIES] = pack_dependencies
+        if self._user_metadata:
+            self._user_metadata[Metadata.DEPENDENCIES] = pack_dependencies
 
     def prepare_for_index_upload(self):
         """ Removes and leaves only necessary files in pack folder.
@@ -1969,7 +2059,7 @@ class Pack(object):
         for pack_file in target_folder_files:
             if pack_file.startswith('.'):
                 continue
-            elif pack_file.endswith('_image.png'):
+            if pack_file.endswith('_image.png'):
                 image_data['repo_image_path'] = os.path.join(root, pack_file)
             elif pack_file.endswith('.yml'):
                 with open(os.path.join(root, pack_file), 'r') as integration_file:
@@ -2446,7 +2536,7 @@ class Pack(object):
         if not os.path.exists(release_notes_dir):
             return
         bc_version_to_text: Dict[str, Optional[str]] = self._breaking_changes_versions_to_text(release_notes_dir)
-        loose_versions: List[LooseVersion] = [LooseVersion(bc_ver) for bc_ver in bc_version_to_text.keys()]
+        loose_versions: List[LooseVersion] = [LooseVersion(bc_ver) for bc_ver in bc_version_to_text]
         predecessor_version: LooseVersion = LooseVersion('0.0.0')
         for changelog_entry in sorted(changelog.keys(), key=LooseVersion):
             rn_loose_version: LooseVersion = LooseVersion(changelog_entry)
@@ -2488,7 +2578,7 @@ class Pack(object):
         else:
             # Important: Currently, implementation of aggregating BCs was decided to concat between them
             # In the future this might be needed to re-thought.
-            return '\n'.join(bc_version_to_text.values())
+            return '\n'.join(bc_version_to_text.values())  # type: ignore[arg-type]
 
     def _handle_many_bc_versions_some_with_text(self, release_notes_dir: str, text_of_bc_versions: List[str],
                                                 bc_versions_without_text: List[str], ) -> str:
@@ -2618,11 +2708,11 @@ def get_upload_data(packs_results_file_path: str, stage: str) -> Tuple[dict, dic
     """
     if os.path.exists(packs_results_file_path):
         packs_results_file = load_json(packs_results_file_path)
-        stage = packs_results_file.get(stage, {})
-        successful_packs_dict = stage.get(BucketUploadFlow.SUCCESSFUL_PACKS, {})
-        failed_packs_dict = stage.get(BucketUploadFlow.FAILED_PACKS, {})
-        successful_private_packs_dict = stage.get(BucketUploadFlow.SUCCESSFUL_PRIVATE_PACKS, {})
-        images_data_dict = stage.get(BucketUploadFlow.IMAGES, {})
+        stage_data: dict = packs_results_file.get(stage, {})
+        successful_packs_dict = stage_data.get(BucketUploadFlow.SUCCESSFUL_PACKS, {})
+        failed_packs_dict = stage_data.get(BucketUploadFlow.FAILED_PACKS, {})
+        successful_private_packs_dict = stage_data.get(BucketUploadFlow.SUCCESSFUL_PRIVATE_PACKS, {})
+        images_data_dict = stage_data.get(BucketUploadFlow.IMAGES, {})
         return successful_packs_dict, failed_packs_dict, successful_private_packs_dict, images_data_dict
     return {}, {}, {}, {}
 
@@ -2673,7 +2763,7 @@ def store_successful_and_failed_packs_in_ci_artifacts(packs_results_file_path: s
         logging.debug(f"Successful packs {successful_packs_dict}")
 
     if updated_private_packs:
-        successful_private_packs_dict = {
+        successful_private_packs_dict: dict = {
             BucketUploadFlow.SUCCESSFUL_PRIVATE_PACKS: {pack_name: {} for pack_name in updated_private_packs}
         }
         packs_results[stage].update(successful_private_packs_dict)
