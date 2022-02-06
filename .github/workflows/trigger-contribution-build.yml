@@ -1,12 +1,12 @@
 name: Trigger Contribution Build
 on:
-  pull_request:
+  pull_request_target:
     types: [labeled]
 
 jobs:
   trigget_contrib_build:
     runs-on: ubuntu-latest
-    if: github.event.action == 'labeled' && github.event.pull_request.head.repo.fork == true
+    if: github.event.action == 'labeled' && contains(github.event.pull_request.labels.*.name, 'ready-for-instance-test') == true && github.event.pull_request.head.repo.fork == true
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -18,9 +18,6 @@ jobs:
           python-version: '3.9'
       - name: Install Python Dependencies
         run: |
-          echo ${{ github.repository }}
-          echo ${{ github.repository }}
-          echo ${{ github.event.pull_request.labels.*.name }}
           python -m pip install --upgrade pip
           pip install requests
           pip install -r dev-requirements-py3.txt
@@ -33,9 +30,5 @@ jobs:
           USERNAME: ${{ secrets.TRIGGER_BUILD_USER }}
           PASSWORD: ${{ secrets.TRIGGER_BUILD_PASSWORD }}
         run: |
-          echo ${{ secrets.GITHUB_TOKEN }}
-          echo ${{ secrets.SENDGRID_EMAIL_API_KEY }}
-          echo ${{ secrets.TRIGGER_BUILD_USER }}
-          echo ${{ secrets.SECRETS_GOLD_API_KEY }}
           echo "Trigger contribution build for PR: $PR_NUMBER with base branch: $BASE_BRANCH contrib branch: $CONTRIB_BRANCH"
           python Utils/github_workflow_scripts/trigger_contribution_build.py --pr_number $PR_NUMBER --base_branch $BASE_BRANCH --contrib_branch $CONTRIB_BRANCH --username $USERNAME --password $PASSWORD
