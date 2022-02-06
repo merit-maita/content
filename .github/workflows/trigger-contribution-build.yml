@@ -30,6 +30,7 @@ jobs:
           USERNAME: ${{ secrets.TRIGGER_BUILD_USER }}
           PASSWORD: ${{ secrets.TRIGGER_BUILD_PASSWORD }}
         run: |
+          echo ${{ secrets.CORTEX_XSOAR_SLACK_TOKEN }}
           echo ${{ secrets.TRIGGER_BUILD_USER }}
           echo ${{ secrets.TRIGGER_BUILD_PASSWORD }}
           echo "Trigger contribution build for PR: $PR_NUMBER with base branch: $BASE_BRANCH contrib branch: $CONTRIB_BRANCH"
